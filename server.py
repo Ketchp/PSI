@@ -224,6 +224,8 @@ class Communication:
                 self.buffer = self.buffer[idx+2:]
                 if not self._parse_message(message):
                     return False
+                if not self._validate_buffer():
+                    return False
             return True
 
         except ServerLoginFailedError:
@@ -288,6 +290,7 @@ class Communication:
         try:
             self.key_id = int(message)
         except ValueError:
+            logging.debug("Wrong key id.")
             raise ServerSyntaxError
         if self.key_id > 4:
             raise ServerKeyOutOfRangeError
@@ -301,6 +304,7 @@ class Communication:
     def _parse_client_hash(self, message):
         m = re.match(r'^(\d{1,5})$', message)
         if not m:
+            logging.debug("Wrong client hash.")
             raise ServerSyntaxError
 
         message = int(m.group())
@@ -316,24 +320,56 @@ class Communication:
         self.sock.send(move)
 
     def _validate_buffer(self):
+        if not self.buffer:
+            return True
+        recharging = 'RECHARGING\a\b'
+        if recharging.startswith(self.buffer[:len(recharging)]):
+            return True
+
+        full_power = 'FULL POWER\a\b'
+        if full_power.startswith(self.buffer[:len(full_power)]):
+            return True
+
         if self.stage == Stage.INITIAL:
             if len(self.buffer) == 19:
                 if self.buffer[-1] != '\a' and self.buffer.find('\a\b') == -1:
+                    logging.debug("Invalid buffer.")
                     raise ServerSyntaxError
             if len(self.buffer) >= 20:
                 text_len = self.buffer.find('\a\b')
                 if text_len == -1 or text_len > 18:
+                    logging.debug("Invalid buffer.")
                     raise ServerSyntaxError
+
         elif self.stage == Stage.AWAITING_SECRET:
             if len(self.buffer) == 99:
                 if self.buffer[-1] != '\a' and self.buffer.find('\a\b') == -1:
+                    logging.debug("Invalid buffer.")
                     raise ServerSyntaxError
             if len(self.buffer) >= 100:
                 secret_len = self.buffer.find('\a\b')
                 if secret_len == -1 or secret_len > 98:
+                    logging.debug("Invalid buffer.")
                     raise ServerSyntaxError
 
         elif self.stage == Stage.MOVING:
+            matchers = (r'(^O$)',
+                        r'(^OK$)',
+                        r'(^OK -?$)',
+                        r'(^OK -?\d{1,6}$)',
+                        r'(^OK -?\d{1,6} -?$)',
+                        r'(^OK -?\d{1,6} -?\d{1,6}$)',
+                        r'(^OK -?\d{1,6} -?\d{1,6}\x07$)',
+                        r'(^OK -?\d{1,6} -?\d{1,6}\x07\x08$).*')
+            matches = [re.match(matcher, self.buffer) for matcher in matchers]
+            if all(match is None for match in matches):
+                logging.debug("Invalid buffer.")
+                raise ServerSyntaxError
+
+            match, = (match for match in matches if match is not None)
+            if len(match.groups()[0]) > 12:
+                logging.debug("Invalid buffer.")
+                raise ServerSyntaxError
 
         return True
 
@@ -341,14 +377,19 @@ class Communication:
         self.sock.close()
 
     def _parse_charging(self, message):
-        if message == 'RECHARGING\a\b' and self.charging:
+        if self.charging and message != 'FULL POWER':
+            raise ServerLogicError
+
+        if message == 'RECHARGING':
             if self.charging:
                 raise ServerLogicError
+            logging.debug('Recharging')
             self.charging = True
             return True
-        if message == 'FULL POWER\a\b':
+        if message == 'FULL POWER':
             if not self.charging:
                 raise ServerLogicError
+            logging.debug('Full power')
             self.charging = False
             return True
         return False
@@ -356,6 +397,7 @@ class Communication:
     def _parse_move(self, message: str) -> np.ndarray:
         m = re.match(r'^OK (-?\d+) (-?\d+)$', message)
         if not m:
+            logging.debug("Wrong move.")
             raise ServerSyntaxError
         x, y = (int(i) for i in m.groups())
         return np.array((x, y))
