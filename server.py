@@ -9,22 +9,61 @@ from enum import Enum
 from threading import Thread
 
 
+class ServerMessages(Enum):
+    SERVER_CONFIRMATION = '{}'
+    SERVER_MOVE = '102 MOVE'
+    SERVER_TURN_LEFT = '103 TURN LEFT'
+    SERVER_TURN_RIGHT = '104 TURN RIGHT'
+    SERVER_PICK_UP = '105 GET MESSAGE'
+    SERVER_LOGOUT = '106 LOGOUT'
+    SERVER_KEY_REQUEST = '107 KEY REQUEST'
+    SERVER_OK = '200 OK'
+    SERVER_LOGIN_FAILED = '300 LOGIN FAILED'
+    SERVER_SYNTAX_ERROR = '301 SYNTAX ERROR'
+    SERVER_LOGIC_ERROR = '302 LOGIC ERROR'
+    SERVER_KEY_OUT_OF_RANGE_ERROR = '303 KEY OUT OF RANGE'
+
+
+class ServerLoginFailedError(Exception):
+    ...
+
+
+class ServerSyntaxError(Exception):
+    ...
+
+
+class ServerLogicError(Exception):
+    ...
+
+
+class ServerKeyOutOfRangeError(Exception):
+    ...
+
+
 class Server:
     def __init__(self, address: str, port: int):
-        print(address, port)
+        logging.info(f'{address=}, {port=}')
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind((address, port))
         self.sock = sock
+        self.threads = []
 
     def start(self):
-        self.sock.listen(1024)
-        logging.info('Server is listening.')
+        try:
+            self.sock.listen(1024)
+            logging.info('Server is listening.')
 
-        while True:
-            conn, remote = self.sock.accept()
-            logging.info(f'New connection: {remote}')
+            while True:
+                conn, remote = self.sock.accept()
+                logging.info(f'New connection: {remote}')
 
-            Thread(target=Communication(conn, remote).start).start()
+                t = Thread(target=Communication(conn, remote).start)
+                t.start()
+                self.threads.append(t)
+        except KeyboardInterrupt:
+            logging.info('Closing server...')
+            for thread in self.threads:
+                thread.join()
 
 
 class Rotation:
@@ -46,41 +85,13 @@ def dist_from_centre(position: np.ndarray):
     return np.sum(np.abs(position))
 
 
-def move_decorator(func):
-    def inner(self, *args, **kwargs):
-        pos = self.position
-        rot = self.rotation
-        stuck = self.stuck
-        move = func(self, *args, **kwargs)
-        logging.debug(f'Moving: {pos=}, {rot=}, {stuck=}, {move=}')
-        return move
-    return inner
-
-
-def position_decorator(func):
-    def inner(self, *args, **kwargs):
-        pos = self.position
-        ret = func(self, *args, **kwargs)
-        new_pos = self.position
-        rot = self.rotation
-        stuck = self.stuck
-        logging.debug(f'New position: {pos=}, {new_pos=} {rot=}, {stuck=}')
-        return ret
-    return inner
-
-
 class Robot:
-    SERVER_MOVE = b'102 MOVE\a\b'
-    SERVER_TURN_LEFT = b'103 TURN LEFT\a\b'
-    SERVER_TURN_RIGHT = b'104 TURN RIGHT\a\b'
-
     def __init__(self):
         self.rotation = None
         self.position = None
         self.stuck = False
         self.move = None
 
-    @position_decorator
     def add_position(self, position: np.ndarray):
         if self.position is None:
             self.position = position
@@ -90,18 +101,18 @@ class Robot:
             dp = position - self.position
             self.position = position
             if np.all(dp == (0, 0)):
-                self.stuck = self.move == Robot.SERVER_MOVE
+                self.stuck = self.move == ServerMessages.SERVER_MOVE
                 return self._at_start
 
             self.stuck = False
             self.rotation = dp
             return self._at_start
 
-        if np.all(position == self.position) and self.move == Robot.SERVER_MOVE:
+        if np.all(position == self.position) and self.move == ServerMessages.SERVER_MOVE:
             self.stuck = True
             return self._at_start
 
-        if self.stuck and self.move in (Robot.SERVER_TURN_RIGHT, Robot.SERVER_TURN_LEFT):
+        if self.stuck and self.move in (ServerMessages.SERVER_TURN_RIGHT, ServerMessages.SERVER_TURN_LEFT):
             return self._at_start
 
         self.stuck = False
@@ -114,54 +125,37 @@ class Robot:
             return False
         return np.all(self.position == (0, 0))
 
-    @move_decorator
     def get_move(self):
         if self.position is None:
-            self.move = Robot.SERVER_TURN_RIGHT
+            self.move = ServerMessages.SERVER_TURN_RIGHT
             return self.move
 
         if self.rotation is None:
             if self.stuck:
-                self.move = Robot.SERVER_TURN_LEFT
+                self.move = ServerMessages.SERVER_TURN_LEFT
                 return self.move
-            self.move = Robot.SERVER_MOVE
+            self.move = ServerMessages.SERVER_MOVE
             return self.move
 
         if self.stuck or dist_from_centre(self.position + self.rotation) >= dist_from_centre(self.position):
-            if self.stuck and self.move in (Robot.SERVER_TURN_RIGHT, Robot.SERVER_TURN_LEFT):
-                self.move = Robot.SERVER_MOVE
+            if self.stuck and self.move in (ServerMessages.SERVER_TURN_RIGHT, ServerMessages.SERVER_TURN_LEFT):
+                self.move = ServerMessages.SERVER_MOVE
                 return self.move
             return self._get_next_rotation()
 
-        self.move = Robot.SERVER_MOVE
+        self.move = ServerMessages.SERVER_MOVE
         return self.move
 
     def _get_next_rotation(self):
         next_rot = Rotation.turn_left(self.rotation)
         if dist_from_centre(self.position + next_rot) < dist_from_centre(self.position):
             self.rotation = next_rot
-            self.move = Robot.SERVER_TURN_LEFT
+            self.move = ServerMessages.SERVER_TURN_LEFT
             return self.move
         else:
             self.rotation = Rotation.turn_right(self.rotation)
-            self.move = Robot.SERVER_TURN_RIGHT
+            self.move = ServerMessages.SERVER_TURN_RIGHT
             return self.move
-
-
-class ServerLoginFailedError(Exception):
-    ...
-
-
-class ServerSyntaxError(Exception):
-    ...
-
-
-class ServerLogicError(Exception):
-    ...
-
-
-class ServerKeyOutOfRangeError(Exception):
-    ...
 
 
 class Stage(Enum):
@@ -193,18 +187,17 @@ class Communication:
         self.robot = Robot()
 
     def start(self):
+        self.sock.settimeout(1)
         while True:
-            if self.charging:
-                self.sock.settimeout(5)
-            else:
-                self.sock.settimeout(1)
             try:
                 data = self.sock.recv(1024)
             except TimeoutError:
-                return self._terminate()
+                self._close()
+                break
 
             if not data:
-                return self._terminate()
+                self._close()
+                break
 
             logging.debug(f'Message from {self.addr}: {data}')
             stream = data.decode()
@@ -212,81 +205,69 @@ class Communication:
             if not self._parse_stream(stream):
                 return
 
-    def _parse_stream(self, stream: str):
+    def _parse_stream(self, stream: str) -> bool:
         """ Return False if connection should be terminated. """
         self.buffer += stream
         try:
-            if not self._validate_buffer():
-                return False
+            while True:
+                if not self._validate_buffer():
+                    return False
+                idx = self.buffer.find('\a\b')
+                if idx == -1:
+                    return True
 
-            while (idx := self.buffer.find('\a\b')) != -1:
                 message = self.buffer[:idx]
                 self.buffer = self.buffer[idx+2:]
                 if not self._parse_message(message):
                     return False
-                if not self._validate_buffer():
-                    return False
-            return True
 
         except ServerLoginFailedError:
-            self.sock.send(b'300 LOGIN FAILED\a\b')
-            logging.debug('Sending: 300 LOGIN FAILED')
-            self._terminate()
-            return False
+            self._send(ServerMessages.SERVER_LOGIN_FAILED)
 
         except ServerSyntaxError:
-            self.sock.send(b'301 SYNTAX ERROR\a\b')
-            logging.debug('Sending: 301 SYNTAX ERROR')
-            self._terminate()
-            return False
+            self._send(ServerMessages.SERVER_SYNTAX_ERROR)
 
         except ServerLogicError:
-            self.sock.send(b'302 LOGIC ERROR\a\b')
-            logging.debug('Sending: 302 LOGIC ERROR')
-            self._terminate()
-            return False
+            self._send(ServerMessages.SERVER_LOGIC_ERROR)
 
         except ServerKeyOutOfRangeError:
-            self.sock.send(b'303 KEY OUT OF RANGE\a\b')
-            logging.debug('Sending: 303 KEY OUT OF RANGE')
-            self._terminate()
-            return False
+            self._send(ServerMessages.SERVER_KEY_OUT_OF_RANGE_ERROR)
 
-    def _parse_message(self, message: str):
+        return False
+
+    def _parse_message(self, message: str) -> bool:
         """ Return False if connection should be terminated. """
+        logging.debug(f'Processing {message}')
         if self._parse_charging(message):
             return True
 
         if self.stage == Stage.INITIAL:
-            self._parse_name(message)
-        elif self.stage == Stage.AWAITING_KEY_ID:
-            self._parse_key_id(message)
-        elif self.stage == Stage.AWAITING_CLIENT_HASH:
-            self._parse_client_hash(message)
-        elif self.stage == Stage.MOVING:
+            return self._parse_name(message)
+        if self.stage == Stage.AWAITING_KEY_ID:
+            return self._parse_key_id(message)
+        if self.stage == Stage.AWAITING_CLIENT_HASH:
+            return self._parse_client_hash(message)
+        if self.stage == Stage.MOVING:
             position = self._parse_move(message)
             if self.robot.add_position(position):
-                self.sock.send(b'105 GET MESSAGE\a\b')
                 self.stage = Stage.AWAITING_SECRET
-                return True
+                return self._send(ServerMessages.SERVER_PICK_UP)
+
             move = self.robot.get_move()
-            self.sock.send(move)
+            return self._send(move)
 
-        elif self.stage == Stage.AWAITING_SECRET:
-            self.sock.send(b'106 LOGOUT\a\b')
-            self._terminate()
-            return False
-        return True
+        if self.stage == Stage.AWAITING_SECRET:
+            return self._send(ServerMessages.SERVER_LOGOUT)
 
-    def _parse_name(self, message: str):
+        raise ValueError('Unknown stage.')
+
+    def _parse_name(self, message: str) -> bool:
         self.remote_name = message
         self.name_hash = sum(ord(c) for c in message) * 1000 % Communication.MODULO
         self.stage = Stage.AWAITING_KEY_ID
-        self.sock.send(b'107 KEY REQUEST\a\b')
-        logging.debug('Sending: 107 KEY REQUEST')
-        # todo: check length max 18
+        return self._send(ServerMessages.SERVER_KEY_REQUEST)
 
-    def _parse_key_id(self, message):
+    def _parse_key_id(self, message: str) -> bool:
         try:
             self.key_id = int(message)
         except ValueError:
@@ -296,12 +277,10 @@ class Communication:
             raise ServerKeyOutOfRangeError
         self.key_pair = self._key_pairs[self.key_id]
         server_hash = (self.key_pair[0] + self.name_hash) % Communication.MODULO
-        self.sock.send(f'{server_hash}\a\b'.encode())
-        logging.debug(f'Sending: {server_hash}')
         self.stage = Stage.AWAITING_CLIENT_HASH
-        # todo: check length max 3
+        return self._send(ServerMessages.SERVER_CONFIRMATION, server_hash)
 
-    def _parse_client_hash(self, message):
+    def _parse_client_hash(self, message: str) -> bool:
         m = re.match(r'^(\d{1,5})$', message)
         if not m:
             logging.debug("Wrong client hash.")
@@ -312,12 +291,59 @@ class Communication:
         if client_hash != message:
             raise ServerLoginFailedError
 
-        self.sock.send(b'200 OK\a\b')
-        logging.debug('Sending: 200 OK')
+        self._send(ServerMessages.SERVER_OK)
 
         self.stage = Stage.MOVING
         move = self.robot.get_move()
-        self.sock.send(move)
+        return self._send(move)
+
+    def _parse_charging(self, message):
+        if self.charging and message != 'FULL POWER':
+            raise ServerLogicError
+
+        if message == 'RECHARGING':
+            if self.charging:
+                raise ServerLogicError
+            logging.info('Recharging')
+            self.charging = True
+            self.sock.settimeout(5)
+            return True
+        if message == 'FULL POWER':
+            if not self.charging:
+                raise ServerLogicError
+            logging.info('Full power')
+            self.charging = False
+            self.sock.settimeout(1)
+            return True
+        return False
+
+    @classmethod
+    def _parse_move(cls, message: str) -> np.ndarray:
+        m = re.match(r'^OK (-?\d+) (-?\d+)$', message)
+        if not m:
+            logging.debug("Wrong move.")
+            raise ServerSyntaxError
+        x, y = (int(i) for i in m.groups())
+        return np.array((x, y))
+
+    def _send(self, message: ServerMessages, *args):
+        close = message in (ServerMessages.SERVER_LOGIN_FAILED,
+                            ServerMessages.SERVER_SYNTAX_ERROR,
+                            ServerMessages.SERVER_LOGIC_ERROR,
+                            ServerMessages.SERVER_KEY_OUT_OF_RANGE_ERROR,
+                            ServerMessages.SERVER_LOGOUT)
+
+        message = message.value.format(*args) + '\a\b'
+        logging.debug(f'Sending: {message}')
+        self.sock.send(message.encode())
+        if close:
+            self._close()
+
+        return not close
+
+    def _close(self):
+        logging.info('Closing connection...')
+        self.sock.close()
 
     def _validate_buffer(self):
         if not self.buffer:
@@ -373,35 +399,6 @@ class Communication:
 
         return True
 
-    def _terminate(self):
-        self.sock.close()
-
-    def _parse_charging(self, message):
-        if self.charging and message != 'FULL POWER':
-            raise ServerLogicError
-
-        if message == 'RECHARGING':
-            if self.charging:
-                raise ServerLogicError
-            logging.debug('Recharging')
-            self.charging = True
-            return True
-        if message == 'FULL POWER':
-            if not self.charging:
-                raise ServerLogicError
-            logging.debug('Full power')
-            self.charging = False
-            return True
-        return False
-
-    def _parse_move(self, message: str) -> np.ndarray:
-        m = re.match(r'^OK (-?\d+) (-?\d+)$', message)
-        if not m:
-            logging.debug("Wrong move.")
-            raise ServerSyntaxError
-        x, y = (int(i) for i in m.groups())
-        return np.array((x, y))
-
 
 def main():
     if len(sys.argv) < 3:
@@ -411,17 +408,12 @@ def main():
     address = sys.argv[1]
 
     byte_regex = r'(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)'
-    IPv4_regex = r'\.'.join([byte_regex] * 4)
+    IPv4_regex = '^' + r'\.'.join([byte_regex] * 4) + '$'
 
     m = re.match(IPv4_regex, address)
     if m is None:
-        print("Usage: <address> <port>", file=sys.stderr)
+        print("Wrong IP address", file=sys.stderr)
         return 1
-
-    for b in m.groups():
-        if not 0 <= int(b) < 256:
-            print("IP address out of range.", file=sys.stderr)
-            return 1
 
     port = int(sys.argv[2])
     if port > 65535:
@@ -430,8 +422,9 @@ def main():
 
     server = Server(address, port)
     server.start()
+    return 0
 
 
 if __name__ == '__main__':
-    logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger().setLevel(logging.INFO)
     sys.exit(main())
